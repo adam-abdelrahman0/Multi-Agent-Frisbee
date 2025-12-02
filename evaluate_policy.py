@@ -13,7 +13,7 @@ from envs.dynamic_ultimate_frisbee import DynamicUltimateFrisbeeEnv
 
 def rllib_env_creator(env_config=None):
     base_env = DynamicUltimateFrisbeeEnv(
-        num_players_per_team=5,
+        num_players_per_team=7,
         use_regulation_field=True,
         seed=0,
         max_steps=800,
@@ -31,14 +31,14 @@ if __name__ == "__main__":
 
     # This must be the path to a single checkpoint, not just the parent folder.
     # Example: "/Users/adam-admin/code/Multi-Agent-Frisbee/checkpoints/checkpoint_000250"
-    checkpoint_path = "/Users/adam-admin/code/Multi-Agent-Frisbee/checkpoints"
+    checkpoint_path = "/Users/adam-admin/code/Multi-Agent-Frisbee/checkpoints/best"
 
     algo = PPO.from_checkpoint(checkpoint_path)
     module = algo.get_module("shared_policy")
 
     # Raw parallel env for visualization
     env = DynamicUltimateFrisbeeEnv(
-        num_players_per_team=4,
+        num_players_per_team=7,
         use_regulation_field=True,
         seed=123,
         max_steps=800,

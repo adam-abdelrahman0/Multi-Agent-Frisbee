@@ -383,16 +383,41 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
                 self._prev_dist_to_goal=None
                 return False
 
-        for d in [a for a in self.agents if self._team_of(a)==1]:
-            if np.linalg.norm(self.agent_positions[d]-self.disc_position)<=self.intercept_range:
+        for d in [a for a in self.agents if self._team_of(a) == 1]:
+            rel = self.agent_positions[d] - self.disc_position
+            dist = np.linalg.norm(rel)
+            if dist < 1e-6:
+                continue
+
+            v = self.disc_velocity
+            nv = np.linalg.norm(v)
+            if nv < 1e-6:
+                continue
+
+            dir = v / nv
+            cos_angle = np.dot(dir, rel) / dist
+            if cos_angle <= 0.6:
+                continue
+
+            proj = np.dot(rel, dir)
+            if proj <= 0 or proj > 1.8:
+                continue
+
+            lateral_vec = rel - proj * dir
+            lateral = np.linalg.norm(lateral_vec)
+            if lateral > self.intercept_range:
+                continue
+
+            p = np.exp(-lateral / 0.5)
+            if self.rng.random() < p:
                 if self._pending_thrower:
-                    rewards[self._pending_thrower]+=REWARD_INTERCEPT
-                self.possession=d
-                self.disc_in_flight=False
-                self.disc_velocity=np.zeros(2)
-                self.disc_target=None
-                self._pending_thrower=None
-                self._prev_dist_to_goal=None
+                    rewards[self._pending_thrower] += REWARD_INTERCEPT
+                self.possession = d
+                self.disc_in_flight = False
+                self.disc_velocity = np.zeros(2)
+                self.disc_target = None
+                self._pending_thrower = None
+                self._prev_dist_to_goal = None
                 return True
 
         return False

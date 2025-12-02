@@ -10,7 +10,7 @@ from envs.dynamic_ultimate_frisbee import DynamicUltimateFrisbeeEnv
 
 def env_creator(env_config=None):
     base_env = DynamicUltimateFrisbeeEnv(
-        num_players_per_team=4,
+        num_players_per_team=7,
         use_regulation_field=True,
         seed=0,
         max_steps=800,
