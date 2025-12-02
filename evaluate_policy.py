@@ -38,19 +38,20 @@ if __name__ == "__main__":
 
     # Raw parallel env for visualization
     env = DynamicUltimateFrisbeeEnv(
-        num_players_per_team=5,
+        num_players_per_team=4,
         use_regulation_field=True,
         seed=123,
         max_steps=800,
         debug=True,
     )
 
-    num_episodes = 3
+    num_episodes = 15
     max_steps = 800
-
+    
     for ep in range(num_episodes):
         print(f"\n--- Episode {ep + 1}/{num_episodes} ---")
-        obs, _ = env.reset()
+        episode_seed = np.random.randint(0, 10_000_000)
+        obs, _ = env.reset(seed=episode_seed)
         terminated = {a: False for a in env.agents}
         truncated = {a: False for a in env.agents}
 
@@ -79,7 +80,7 @@ if __name__ == "__main__":
                 print(f"Episode ended at step {step + 1}")
                 break
 
-        env.render_matplotlib(block=True)
+        env.render_matplotlib(block=False)
 
     env.close()
     ray.shutdown()

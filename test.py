@@ -1,6 +1,6 @@
 from envs.dynamic_ultimate_frisbee import DynamicUltimateFrisbeeEnv
-
-env = DynamicUltimateFrisbeeEnv(num_players_per_team=3, use_regulation_field=True)
+import time
+env = DynamicUltimateFrisbeeEnv(num_players_per_team=5, use_regulation_field=True)
 obs, info = env.reset()
 
 obs, info = env.reset()
