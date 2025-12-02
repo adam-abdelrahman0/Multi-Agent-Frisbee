@@ -9,6 +9,7 @@ try:
 except Exception:
     _HAS_SCIPY = False
 
+
 REWARD_SCORE = 1.0
 REWARD_CATCH = 0.15
 REWARD_PASSER_CATCH = 0.15
@@ -24,9 +25,9 @@ THROW_THRESHOLD = 0.2
 THROW_SPEED_MIN = 3.0
 THROW_SPEED_VAR = 1.2
 
-PLAYER_MAX_SPEED = 0.8
-PLAYER_ACCEL     = 0.35
-PLAYER_FRICTION  = 0.88
+PLAYER_MAX_SPEED = 0.4
+PLAYER_ACCEL = 0.2
+PLAYER_FRICTION = 0.88
 
 
 class DynamicUltimateFrisbeeEnv(ParallelEnv):
@@ -50,6 +51,23 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
         self.steps = 0
         self.rng = np.random.default_rng(seed)
         self._seed = seed
+
+        self.episode_catch_count = 0
+        self.episode_intercept_count = 0
+        self.episode_throw_count = 0
+        self.episode_stallouts = 0
+        self.episode_score = 0
+        self.episode_reason = None
+        self.episode_outcome_step = None
+
+        self.open_throw_threshold = 2.0
+        self.allow_non_open_fallback = True
+        self.fallback_topk = 2
+
+        self.lane_block_width = 1.25
+        self.lane_max_ahead = 9.0
+        self.lane_min_cos = 0.2
+        self.open_min_def_dist = 2.5
 
         if use_regulation_field:
             self.endzone_depth = 20
@@ -76,6 +94,7 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
         self.throw_windup = 0
         self.throw_pending_target = None
         self.min_throw_distance = 5.0
+        self._last_selected_openness = None
 
         self._fig = None
         self._ax = None
@@ -98,6 +117,27 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
     def _norm(self, xy):
         w, h = self.field_size
         return np.array([xy[0] / (w - 1), xy[1] / (h - 1)], np.float32)
+
+    def _set_episode_outcome(self, reason: str):
+        if self.episode_reason is None:
+            self.episode_reason = reason
+            self.episode_outcome_step = self.steps
+
+    def _write_episode_info(self, infos):
+        summary = {
+            "score": int(self.episode_score),
+            "catches": int(self.episode_catch_count),
+            "intercepts": int(self.episode_intercept_count),
+            "throws": int(self.episode_throw_count),
+            "stallouts": int(self.episode_stallouts),
+            "reason": self.episode_reason,
+            "outcome_step": self.episode_outcome_step,
+            "players_per_team": self.num_players_per_team,
+            "max_steps": self.max_steps,
+            "field_size": tuple(self.field_size),
+        }
+        for a in self.agents:
+            infos[a]["episode_summary"] = summary
 
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -134,6 +174,15 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
         self._pending_backward_penalty = 0.0
         self._prev_dist_to_goal = None
 
+        self.episode_catch_count = 0
+        self.episode_intercept_count = 0
+        self.episode_throw_count = 0
+        self.episode_stallouts = 0
+        self.episode_score = 0
+        self.episode_reason = None
+        self.episode_outcome_step = None
+        self._last_selected_openness = None
+
         self._assign_defenders()
         self._last_opos = {}
 
@@ -165,10 +214,12 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
     def step(self, actions):
         self.steps += 1
         fw, fh = self.field_size
+
         rewards = {a: 0.0 for a in self.agents}
         term = {a: False for a in self.agents}
         trunc = {a: self.steps >= self.max_steps for a in self.agents}
         infos = {a: {} for a in self.agents}
+
         prev = {a: self.agent_positions[a].copy() for a in self.agents}
 
         if self.throw_windup > 0:
@@ -183,16 +234,21 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
         if self.disc_in_flight:
             turnover = self._update_disc_flight(rewards)
             if turnover:
-                term = {a: True for a in self.agents}
+                for a in self.agents:
+                    term[a] = True
+                self._write_episode_info(infos)
                 return self._get_obs(), rewards, term, trunc, infos
         else:
             self.possession_timer += 1
             if self.possession_timer > self.possession_stall_limit:
+                self.episode_stallouts += 1
+                self._set_episode_outcome("stall")
                 for a in self.agents:
                     if self._team_of(a) == 0:
                         rewards[a] += REWARD_STALL
                 for a in self.agents:
                     term[a] = True
+                self._write_episode_info(infos)
                 return self._get_obs(), rewards, term, trunc, infos
 
         for a in self.agents:
@@ -208,8 +264,9 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
                     self.player_vel[a] = v
                     pos = self.agent_positions[a]
                     pos += v
-                    pos[:] = np.clip(pos, [0, 0], [fw-1, fh-1])
+                    pos[:] = np.clip(pos, [0, 0], [fw - 1, fh - 1])
                     continue
+
                 accel = np.array([ax, ay]) * PLAYER_ACCEL
                 v = self.player_vel[a] + accel
                 speed = np.linalg.norm(v)
@@ -219,17 +276,37 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
                 self.player_vel[a] = v
                 pos = self.agent_positions[a]
                 pos += v
-                pos[:] = np.clip(pos, [0,0], [fw-1,fh-1])
+                pos[:] = np.clip(pos, [0, 0], [fw - 1, fh - 1])
 
             else:
                 self.player_vel[a] = np.zeros(2)
                 rewards[a] -= 0.02
+
+                team = self._team_of(a)
+                mates = [x for x in self.agents if self._team_of(x) == team and x != a]
+
+                best_openness = 0.0
+                if mates:
+                    for m in mates:
+                        nearest_def = min(
+                            np.linalg.norm(self.agent_positions[d] - self.agent_positions[m])
+                            for d in self.agents if self._team_of(d) != team
+                        )
+                        if nearest_def > best_openness:
+                            best_openness = nearest_def
+
+                if best_openness > 3.0:
+                    rewards[a] -= 0.05
 
                 if throw_raw > THROW_THRESHOLD and not self.disc_in_flight and self.throw_windup == 0:
                     chosen = self._select_throw_target(a, actions)
                     if chosen is not None:
                         self.throw_pending_target = chosen
                         self.throw_windup = 2
+
+                        target_openness = self._last_selected_openness
+                        if target_openness is not None and target_openness > 1.5:
+                            rewards[a] += 0.05
 
         self._assign_defenders()
         self._move_defenders(fw, fh)
@@ -248,74 +325,142 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
             if np.linalg.norm(self.agent_positions[a] - prev[a]) < 0.01:
                 rewards[a] += REWARD_STAGNATION
 
-        offense = [a for a in self.agents if self._team_of(a)==0]
-        for i,a in enumerate(offense):
+        offense = [a for a in self.agents if self._team_of(a) == 0]
+        for i, a in enumerate(offense):
             pos_a = self.agent_positions[a]
-            for b in offense[i+1:]:
+            for b in offense[i + 1 :]:
                 pos_b = self.agent_positions[b]
                 diff = pos_a - pos_b
                 dist = np.linalg.norm(diff)
                 if dist < 4.0 and dist > 1e-6:
-                    repulse = (diff/dist)*0.10
+                    repulse = (diff / dist) * 0.10
                     self.agent_positions[a] += repulse
                     self.agent_positions[b] -= repulse
-                    self.agent_positions[a][:] = np.clip(self.agent_positions[a],[0,0],[fw-1,fh-1])
-                    self.agent_positions[b][:] = np.clip(self.agent_positions[b],[0,0],[fw-1,fh-1])
+                    self.agent_positions[a][:] = np.clip(self.agent_positions[a], [0, 0], [fw - 1, fh - 1])
+                    self.agent_positions[b][:] = np.clip(self.agent_positions[b], [0, 0], [fw - 1, fh - 1])
 
         if self.possession and not self.disc_in_flight:
             px = self.agent_positions[self.possession][0]
             goal_x = self.endzone_depth + self.playing_length
             dist = goal_x - px
+
             if self._prev_dist_to_goal is not None:
                 prog = self._prev_dist_to_goal - dist
                 rewards[self.possession] += REWARD_PROGRESS * prog
             self._prev_dist_to_goal = dist
+
             if px >= goal_x:
                 rewards[self.possession] += REWARD_SCORE
+                self.episode_score = 1
+                self._set_episode_outcome("score")
                 for a in self.agents:
                     term[a] = True
 
+            if self.possession and not self.disc_in_flight:
+                if self.possession_timer >= self.possession_stall_limit / 2:
+                    late = self.possession_timer - (self.possession_stall_limit / 2)
+                    penalty = 0.004 * (late ** 2)
+                    rewards[self.possession] -= penalty
+
+        if all(term.values()) and self.episode_reason is None:
+            self._set_episode_outcome("turnover")
+
+        if any(trunc.values()) and self.episode_reason is None:
+            self._set_episode_outcome("trunc")
+
+        if all(term.values()) or all(trunc.values()):
+            self._write_episode_info(infos)
+
         return self._get_obs(), rewards, term, trunc, infos
+
+    def _lane_is_safe(self, thrower_pos, recv_pred, team):
+        lane = recv_pred - thrower_pos
+        lane_len = np.linalg.norm(lane)
+        if lane_len < 1e-6:
+            return False
+
+        dirv = lane / lane_len
+
+        for d in [a for a in self.agents if self._team_of(a) != team]:
+            rel = self.agent_positions[d] - thrower_pos
+            dist = np.linalg.norm(rel)
+            if dist < 1e-6:
+                return False
+
+            cos_angle = np.dot(dirv, rel) / dist
+            if cos_angle <= self.lane_min_cos:
+                continue
+
+            proj = np.dot(rel, dirv)
+            if proj <= 0:
+                continue
+
+            max_proj = min(lane_len, self.lane_max_ahead)
+            if proj > max_proj:
+                continue
+
+            lateral_vec = rel - proj * dirv
+            lateral = np.linalg.norm(lateral_vec)
+            if lateral <= self.lane_block_width:
+                return False
+
+        return True
 
     def _select_throw_target(self, agent, actions):
         team = self._team_of(agent)
-        mates = [a for a in self.agents if self._team_of(a)==team and a!=agent]
+        mates = [a for a in self.agents if self._team_of(a) == team and a != agent]
+        defenders = [a for a in self.agents if self._team_of(a) != team]
 
-        logits = []
-        pred_positions = []
         thrower_pos = self.agent_positions[agent]
 
+        candidates = []
         for m in mates:
             raw_dist = np.linalg.norm(self.agent_positions[m] - thrower_pos)
             if raw_dist < self.min_throw_distance:
                 continue
 
             mx, my, _ = actions.get(m, np.zeros(3))
-            accel = np.array([mx, my]) * PLAYER_ACCEL
+            accel = np.array([mx, my], dtype=float) * PLAYER_ACCEL
             v = self.player_vel[m] + accel
             s = np.linalg.norm(v)
             if s > PLAYER_MAX_SPEED:
-                v = (v/s)*PLAYER_MAX_SPEED
+                v = (v / s) * PLAYER_MAX_SPEED
 
-            disc_speed = THROW_SPEED_MIN + self.rng.random()*THROW_SPEED_VAR
-            t = raw_dist/disc_speed
-            predicted = self.agent_positions[m] + v*t
-            pred_positions.append((m, predicted))
+            disc_speed = THROW_SPEED_MIN + self.rng.random() * THROW_SPEED_VAR
+            t = raw_dist / disc_speed
+            predicted = self.agent_positions[m] + v * t
 
-            nearest_def = min(
-                np.linalg.norm(self.agent_positions[d] - predicted)
-                for d in self.agents if self._team_of(d)!=team
-            )
+            if not self._lane_is_safe(thrower_pos, predicted, team):
+                continue
+
+            nearest_def = min(np.linalg.norm(self.agent_positions[d] - predicted) for d in defenders)
             progress = max(0.0, predicted[0] - thrower_pos[0])
-            logits.append((nearest_def + 0.2*progress, m))
 
-        if not logits:
+            score = nearest_def + 0.2 * progress
+            candidates.append((m, score, nearest_def, predicted))
+
+        if not candidates:
+            self._last_selected_openness = None
             return None
 
-        arr = np.array([l[0] for l in logits])
-        probs = arr/arr.sum() if arr.sum()>0 else np.ones(len(arr))/len(arr)
-        idx = self.rng.choice(len(arr), p=probs)
-        return logits[idx][1]
+        open_cands = [c for c in candidates if c[2] >= self.open_throw_threshold]
+
+        use = open_cands
+        if not use:
+            if not self.allow_non_open_fallback:
+                self._last_selected_openness = None
+                return None
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            use = candidates[: max(1, min(self.fallback_topk, len(candidates)))]
+
+        scores = np.array([u[1] for u in use], dtype=float)
+        probs = scores / scores.sum() if scores.sum() > 0 else np.ones(len(use)) / len(use)
+
+        idx = self.rng.choice(len(use), p=probs)
+        chosen_m, chosen_score, chosen_open, _ = use[idx]
+        self._last_selected_openness = float(chosen_open)
+        return chosen_m
+
 
     def _execute_throw(self):
         agent = self.possession
@@ -327,7 +472,6 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
 
         thrower_pos = self.agent_positions[agent]
         target_pos = self.agent_positions[target]
-        raw_dist = np.linalg.norm(target_pos - thrower_pos)
 
         thrower_x = thrower_pos[0]
         if target_pos[0] < thrower_x:
@@ -335,52 +479,56 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
         else:
             self._pending_backward_penalty = 0.0
 
-        speed = THROW_SPEED_MIN + self.rng.random()*THROW_SPEED_VAR
+        speed = THROW_SPEED_MIN + self.rng.random() * THROW_SPEED_VAR
         desired_vel = target_pos - thrower_pos
         d = np.linalg.norm(desired_vel)
-        v = desired_vel/d * speed if d>1e-6 else np.zeros(2)
+        v = desired_vel / d * speed if d > 1e-6 else np.zeros(2)
 
-        self.disc_velocity = 0.6*self.disc_velocity + 0.4*v
+        self.disc_velocity = 0.6 * self.disc_velocity + 0.4 * v
         self.disc_in_flight = True
         self._pending_thrower = agent
         self.disc_target = target
         self.possession = None
+        self.episode_throw_count += 1
 
     def _update_disc_flight(self, rewards):
         self.disc_position += self.disc_velocity
         fw, fh = self.field_size
-        x,y = self.disc_position
+        x, y = self.disc_position
 
-        if x<=0 or x>=fw-1 or y<=0 or y>=fh-1:
+        if x <= 0 or x >= fw - 1 or y <= 0 or y >= fh - 1:
             if self._pending_thrower:
                 rewards[self._pending_thrower] += REWARD_INTERCEPT
-            defenders = [a for a in self.agents if self._team_of(a)==1]
-            self.possession = min(defenders, key=lambda d: np.linalg.norm(self.agent_positions[d]-self.disc_position))
-            self.disc_in_flight=False
-            self.disc_velocity=np.zeros(2)
-            self.disc_target=None
-            self._pending_thrower=None
-            self._prev_dist_to_goal=None
+            defenders = [a for a in self.agents if self._team_of(a) == 1]
+            self.possession = min(defenders, key=lambda d: np.linalg.norm(self.agent_positions[d] - self.disc_position))
+            self.disc_in_flight = False
+            self.disc_velocity = np.zeros(2)
+            self.disc_target = None
+            self._pending_thrower = None
+            self._prev_dist_to_goal = None
+            self._set_episode_outcome("oob")
             return True
 
         if self.disc_target is not None:
             recv = self.agent_positions[self.disc_target]
-            if np.linalg.norm(recv-self.disc_position) <= self.catch_range:
+            if np.linalg.norm(recv - self.disc_position) <= self.catch_range:
                 thrower = self._pending_thrower
                 gain = recv[0] - self.agent_positions[thrower][0]
-                if gain<0:
-                    rewards[thrower]+=REWARD_THROW_BACKWARD*abs(gain)
-                rewards[self.disc_target]+=REWARD_CATCH
-                rewards[thrower]+=REWARD_PASSER_CATCH
-                if gain>0:
-                    rewards[thrower]+=0.03*gain
-                self.possession=self.disc_target
-                self.disc_in_flight=False
-                self.disc_velocity=np.zeros(2)
-                self.disc_target=None
-                self._pending_thrower=None
-                self.possession_timer=0
-                self._prev_dist_to_goal=None
+                if gain < 0:
+                    rewards[thrower] += REWARD_THROW_BACKWARD * abs(gain)
+                rewards[self.disc_target] += REWARD_CATCH
+                self.episode_catch_count += 1
+                rewards[thrower] += REWARD_PASSER_CATCH
+                if gain > 0:
+                    rewards[thrower] += 0.03 * gain
+
+                self.possession = self.disc_target
+                self.disc_in_flight = False
+                self.disc_velocity = np.zeros(2)
+                self.disc_target = None
+                self._pending_thrower = None
+                self.possession_timer = 0
+                self._prev_dist_to_goal = None
                 return False
 
         for d in [a for a in self.agents if self._team_of(a) == 1]:
@@ -394,21 +542,21 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
             if nv < 1e-6:
                 continue
 
-            dir = v / nv
-            cos_angle = np.dot(dir, rel) / dist
-            if cos_angle <= 0.6:
+            dirv = v / nv
+            cos_angle = np.dot(dirv, rel) / dist
+            if cos_angle <= 0.3:
                 continue
 
-            proj = np.dot(rel, dir)
-            if proj <= 0 or proj > 1.8:
+            proj = np.dot(rel, dirv)
+            if proj <= 0 or proj > 3.0:
                 continue
 
-            lateral_vec = rel - proj * dir
+            lateral_vec = rel - proj * dirv
             lateral = np.linalg.norm(lateral_vec)
-            if lateral > self.intercept_range:
+            if lateral > 0.6:
                 continue
 
-            p = np.exp(-lateral / 0.5)
+            p = np.exp(-lateral / 1.0)
             if self.rng.random() < p:
                 if self._pending_thrower:
                     rewards[self._pending_thrower] += REWARD_INTERCEPT
@@ -418,115 +566,158 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
                 self.disc_target = None
                 self._pending_thrower = None
                 self._prev_dist_to_goal = None
+                self.episode_intercept_count += 1
+                self._set_episode_outcome("interception")
                 return True
 
         return False
 
     def _assign_defenders(self):
         if not hasattr(self, "persistent_marks"):
-            defenders = [a for a in self.agents if self._team_of(a)==1]
-            offs = [a for a in self.agents if self._team_of(a)==0]
+            defenders = [a for a in self.agents if self._team_of(a) == 1]
+            offs = [a for a in self.agents if self._team_of(a) == 0]
 
             if _HAS_SCIPY:
                 D = np.array([self.agent_positions[d] for d in defenders])
                 O = np.array([self.agent_positions[o] for o in offs])
-                cost = np.linalg.norm(D[:,None,:] - O[None,:,:], axis=-1)
-                r,c = linear_sum_assignment(cost)
-                self.persistent_marks = {defenders[i]:offs[j] for i,j in zip(r,c)}
+                cost = np.linalg.norm(D[:, None, :] - O[None, :, :], axis=-1)
+                r, c = linear_sum_assignment(cost)
+                self.persistent_marks = {defenders[i]: offs[j] for i, j in zip(r, c)}
             else:
-                self.persistent_marks = {d:offs[i%len(offs)] for i,d in enumerate(defenders)}
+                self.persistent_marks = {d: offs[i % len(offs)] for i, d in enumerate(defenders)}
 
         self.defensive_marks = self.persistent_marks.copy()
 
     def _move_defenders(self, fw, fh):
-        reaction_speed=0.5
-        chase_speed=PLAYER_MAX_SPEED*0.9
-        anticipation=0.3
+        anticipation = 0.3
+        defender_max_speed = PLAYER_MAX_SPEED * 0.85
+        defender_accel = PLAYER_ACCEL * 0.30
+        defender_friction = PLAYER_FRICTION
 
-        if not hasattr(self,"_def_vel"):
-            self._def_vel={d:np.zeros(2) for d in self.defensive_marks}
+        if not hasattr(self, "_def_vel"):
+            self._def_vel = {d: np.zeros(2) for d in self.defensive_marks}
 
-        for d,o in self.defensive_marks.items():
+        for d, o in self.defensive_marks.items():
             if o is None:
                 continue
 
-            dpos=self.agent_positions[d]
-            opos=self.agent_positions[o]
+            dpos = self.agent_positions[d]
+            opos = self.agent_positions[o]
 
-            disc_x,disc_y=self.disc_position
-            disc_to_cutter=opos-self.disc_position
-            dist=np.linalg.norm(disc_to_cutter)
-            if dist>1e-6:
-                lane_block=self.disc_position+(disc_to_cutter/dist)*(0.6*dist)
+            disc_x, disc_y = self.disc_position
+            disc_to_cutter = opos - self.disc_position
+            dist = np.linalg.norm(disc_to_cutter)
+            if dist > 1e-6:
+                lane_block = self.disc_position + (disc_to_cutter / dist) * (0.4 * dist)
             else:
-                lane_block=opos.copy()
+                lane_block = opos.copy()
 
-            desired_pos=lane_block.copy()
-            desired_pos[1]=opos[1]+0.3*(opos[1]-disc_y)
+            desired_pos = lane_block.copy()
+            desired_pos[1] = opos[1] + 0.3 * (opos[1] - disc_y)
 
             if o in self._last_opos:
-                cutter_vel = opos-self._last_opos[o]
-                desired_pos += anticipation*cutter_vel
+                cutter_vel = opos - self._last_opos[o]
+                desired_pos += anticipation * cutter_vel
 
-            move_vec = desired_pos-dpos
-            n=np.linalg.norm(move_vec)
-            if n>1e-6:
-                move_vec/=n
+            move_vec = desired_pos - dpos
+            n = np.linalg.norm(move_vec)
+            move_dir = move_vec / n if n > 1e-6 else np.zeros(2)
 
-            self._def_vel[d]=reaction_speed*move_vec*chase_speed+(1-reaction_speed)*self._def_vel[d]
-            new_pos=dpos+self._def_vel[d]
-            self.agent_positions[d]=np.clip(new_pos,[0,0],[fw-1,fh-1])
+            accel = move_dir * defender_accel
+            v = self._def_vel[d] + accel
 
-        self._last_opos={o:self.agent_positions[o].copy() for o in self.defensive_marks.values() if o is not None}
+            speed = np.linalg.norm(v)
+            if speed > defender_max_speed:
+                v = (v / speed) * defender_max_speed
+
+            v *= defender_friction
+            self._def_vel[d] = v
+
+            new_pos = dpos + v
+            self.agent_positions[d] = np.clip(new_pos, [0, 0], [fw - 1, fh - 1])
+
+        self._last_opos = {o: self.agent_positions[o].copy() for o in self.defensive_marks.values() if o is not None}
+
+    def _is_open_receiver(self, thrower, receiver):
+        if thrower is None or receiver is None:
+            return False
+        if self._team_of(thrower) != self._team_of(receiver):
+            return False
+
+        thrower_pos = self.agent_positions[thrower]
+        recv_pos = self.agent_positions[receiver]
+
+        nearest_def = min(
+            np.linalg.norm(self.agent_positions[d] - recv_pos)
+            for d in self.agents if self._team_of(d) != self._team_of(thrower)
+        )
+        if nearest_def < self.open_min_def_dist:
+            return False
+
+        return self._lane_is_safe(thrower_pos, recv_pos, self._team_of(thrower))
 
     def render_matplotlib(self, block=False):
         if self._fig is None:
-            self._fig,self._ax=plt.subplots(figsize=(12,6))
+            self._fig, self._ax = plt.subplots(figsize=(12, 6))
             plt.ion()
-        ax=self._ax
+        ax = self._ax
         ax.clear()
 
-        fw,fh=self.field_size
-        ax.set_xlim(-0.5,fw-0.5)
-        ax.set_ylim(-0.5,fh-0.5)
+        fw, fh = self.field_size
+        ax.set_xlim(-0.5, fw - 0.5)
+        ax.set_ylim(-0.5, fh - 0.5)
         ax.set_aspect("equal")
 
-        stall_text=f"Stall: {int(self.possession_timer)} / {self.possession_stall_limit}"
-        ax.set_title(f"Ultimate Frisbee (Team 0 offense) — {stall_text}")
+        stall_text = f"Stall: {int(self.possession_timer)} / {self.possession_stall_limit}"
+        reason = self.episode_reason if self.episode_reason is not None else "-"
+        ax.set_title(f"Ultimate Frisbee (Team 0 offense) — {stall_text} | reason: {reason}")
 
-        ax.axvspan(0,self.endzone_depth,color="lightgreen",alpha=0.25)
-        ax.axvspan(self.endzone_depth+self.playing_length,fw,color="lightgreen",alpha=0.25)
-        ax.axvline(self.endzone_depth,color="black",linestyle="--",alpha=0.7)
-        ax.axvline(self.endzone_depth+self.playing_length,color="black",linestyle="--",alpha=0.7)
+        ax.axvspan(0, self.endzone_depth, color="lightgreen", alpha=0.25)
+        ax.axvspan(self.endzone_depth + self.playing_length, fw, color="lightgreen", alpha=0.25)
+        ax.axvline(self.endzone_depth, color="black", linestyle="--", alpha=0.7)
+        ax.axvline(self.endzone_depth + self.playing_length, color="black", linestyle="--", alpha=0.7)
 
-        for a,pos in self.agent_positions.items():
-            team=self._team_of(a)
-            color="red" if team==0 else "blue"
-            is_poss=(a==self.possession and not self.disc_in_flight)
-            ax.scatter(pos[0],pos[1],color=color,s=120 if is_poss else 70,
-                       marker="*" if is_poss else "o",zorder=3)
-            ax.text(pos[0]+0.3,pos[1]+0.3,a.split("_")[-1],fontsize=8)
+        for a, pos in self.agent_positions.items():
+            team = self._team_of(a)
+            color = "red" if team == 0 else "blue"
+            is_poss = (a == self.possession and not self.disc_in_flight)
+            ax.scatter(pos[0], pos[1], color=color, s=120 if is_poss else 70, marker="*" if is_poss else "o", zorder=3)
+            ax.text(pos[0] + 0.3, pos[1] + 0.3, a.split("_")[-1], fontsize=8)
+        
+        if self.possession is not None and not self.disc_in_flight:
+            team = self._team_of(self.possession)
+            mates = [a for a in self.agents if self._team_of(a) == team and a != self.possession]
 
-        for d,mark in self.defensive_marks.items():
+            open_mates = [m for m in mates if self._is_open_receiver(self.possession, m)]
+            for m in open_mates:
+                p = self.agent_positions[m]
+                ax.scatter(
+                    p[0], p[1],
+                    s=260,
+                    facecolors="none",
+                    edgecolors="lime",
+                    linewidths=2.5,
+                    zorder=6
+                )
+
+        for d, mark in self.defensive_marks.items():
             if mark is not None:
-                dpos=self.agent_positions[d]
-                mpos=self.agent_positions[mark]
-                ax.plot([dpos[0],mpos[0]],[dpos[1],mpos[1]],
-                        linestyle="--",linewidth=1.0,alpha=0.5,color="gray")
+                dpos = self.agent_positions[d]
+                mpos = self.agent_positions[mark]
+                ax.plot([dpos[0], mpos[0]], [dpos[1], mpos[1]],
+                        linestyle="--", linewidth=1.0, alpha=0.5, color="gray")
 
         if self.disc_in_flight:
-            ax.scatter(self.disc_position[0],self.disc_position[1],
-                       color="yellow",s=140,marker="o",zorder=5)
+            ax.scatter(self.disc_position[0], self.disc_position[1], color="yellow", s=140, marker="o", zorder=5)
             if self.disc_target is not None:
-                tpos=self.agent_positions[self.disc_target]
-                ax.plot([self.disc_position[0],tpos[0]],
-                        [self.disc_position[1],tpos[1]],
-                        linestyle=":",color="orange",alpha=0.6,zorder=4)
+                tpos = self.agent_positions[self.disc_target]
+                ax.plot([self.disc_position[0], tpos[0]],
+                        [self.disc_position[1], tpos[1]],
+                        linestyle=":", color="orange", alpha=0.6, zorder=4)
         elif self.possession:
-            dp=self.agent_positions[self.possession]
-            ax.scatter(dp[0],dp[1],s=220,facecolors='none',
-                       edgecolors='orange',linewidths=2,zorder=4)
-            ax.scatter(dp[0],dp[1],color="yellow",s=80,marker="o",zorder=5)
+            dp = self.agent_positions[self.possession]
+            ax.scatter(dp[0], dp[1], s=220, facecolors="none", edgecolors="orange", linewidths=2, zorder=4)
+            ax.scatter(dp[0], dp[1], color="yellow", s=80, marker="o", zorder=5)
 
         plt.draw()
         plt.pause(0.03)
@@ -537,5 +728,5 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
     def close(self):
         if self._fig is not None:
             plt.close(self._fig)
-            self._fig=None
-            self._ax=None
+            self._fig = None
+            self._ax = None
