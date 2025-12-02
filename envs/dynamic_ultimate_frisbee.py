@@ -70,10 +70,10 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
         self.observation_spaces = {a: spaces.Box(0, 1, (obs_dim,), np.float32) for a in self.agents}
         self.action_spaces = {a: spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32) for a in self.agents}
 
-        self.intercept_range = 0.3
-        self.catch_range = 3.5
+        self.intercept_range = 1.0
+        self.catch_range = 2
         self.defender_mark_distance = 2.0
-        self.possession_stall_limit = 10
+        self.possession_stall_limit = 30
 
         self._fig = None
         self._ax = None
@@ -109,11 +109,14 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
         self.agent_positions = {}
 
         left_x = self.endzone_depth
-        right_x = self.endzone_depth + self.playing_length
+        quarter_x = self.endzone_depth + self.playing_length * 0.25
 
         for i, y in enumerate(ys):
+            # Offense at left_x (normal)
             self.agent_positions[f"team_0_player_{i}"] = np.array([left_x, y], float)
-            self.agent_positions[f"team_1_player_{i}"] = np.array([right_x, y], float)
+
+            # Defense at quarter field
+            self.agent_positions[f"team_1_player_{i}"] = np.array([quarter_x, y], float)
 
         self.player_vel = {a: np.zeros(2) for a in self.agents}
 
@@ -256,6 +259,25 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
             if np.linalg.norm(self.agent_positions[a] - prev[a]) < 0.01:
                 rewards[a] += REWARD_STAGNATION
 
+        offense = [a for a in self.agents if self._team_of(a) == 0]
+
+        for i, a in enumerate(offense):
+            pos_a = self.agent_positions[a]
+            for b in offense[i+1:]:
+                pos_b = self.agent_positions[b]
+                diff = pos_a - pos_b
+                dist = np.linalg.norm(diff)
+
+                if dist < 4.0 and dist > 1e-6:
+                    repulse = (diff / dist) * 0.10   # 0.10 is very small but effective
+                    # directly nudge both players apart
+                    self.agent_positions[a] += repulse
+                    self.agent_positions[b] -= repulse
+
+                    # clamp to field
+                    self.agent_positions[a][:] = np.clip(self.agent_positions[a], [0,0], [fw-1, fh-1])
+                    self.agent_positions[b][:] = np.clip(self.agent_positions[b], [0,0], [fw-1, fh-1])
+
         if self.possession and not self.disc_in_flight:
             px = self.agent_positions[self.possession][0]
             goal_x = self.endzone_depth + self.playing_length
@@ -381,29 +403,23 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
         return False
 
     def _assign_defenders(self):
-        defenders = [a for a in self.agents if self._team_of(a) == 1]
-        offs = [a for a in self.agents if self._team_of(a) == 0]
-        if not defenders or not offs:
-            self.defensive_marks = {d: None for d in defenders}
-            return
+        # Keep defenders matched to same cutter for whole possession
+        if not hasattr(self, "persistent_marks"):
+            # initial assignment using Hungarian
+            defenders = [a for a in self.agents if self._team_of(a) == 1]
+            offs = [a for a in self.agents if self._team_of(a) == 0]
 
-        if _HAS_SCIPY:
-            D = np.array([self.agent_positions[d] for d in defenders])
-            O = np.array([self.agent_positions[o] for o in offs])
-            cost = np.linalg.norm(D[:, None, :] - O[None, :, :], axis=-1)
-            r, c = linear_sum_assignment(cost)
-            self.defensive_marks = {defenders[i]: offs[j] for i, j in zip(r, c)}
-        else:
-            rem = set(offs)
-            marks = {}
-            for d in defenders:
-                if rem:
-                    nearest = min(rem, key=lambda o: np.linalg.norm(self.agent_positions[d] - self.agent_positions[o]))
-                    rem.remove(nearest)
-                else:
-                    nearest = min(offs, key=lambda o: np.linalg.norm(self.agent_positions[d] - self.agent_positions[o]))
-                marks[d] = nearest
-            self.defensive_marks = marks
+            if _HAS_SCIPY:
+                D = np.array([self.agent_positions[d] for d in defenders])
+                O = np.array([self.agent_positions[o] for o in offs])
+                cost = np.linalg.norm(D[:, None, :] - O[None, :, :], axis=-1)
+                r, c = linear_sum_assignment(cost)
+                self.persistent_marks = {defenders[i]: offs[j] for i, j in zip(r, c)}
+            else:
+                self.persistent_marks = {d: offs[i % len(offs)] for i, d in enumerate(defenders)}
+
+        self.defensive_marks = self.persistent_marks.copy()
+
 
     def _move_defenders(self, fw, fh):
         reaction_speed = 0.5
@@ -424,7 +440,16 @@ class DynamicUltimateFrisbeeEnv(ParallelEnv):
             diff = opos - dpos
             dist = np.linalg.norm(diff)
 
-            desired_pos = opos - (diff / (dist + 1e-6)) * cushion
+            disc_x, disc_y = self.disc_position
+
+            # Force side position: defender stays between disc and cutter
+            force_dir = np.sign(opos[0] - disc_x)  # +1 or -1 depending on side
+
+            horizontal_offset = 2.0 * force_dir
+            vertical_offset = 0.5 * (opos[1] - disc_y)
+
+            desired_pos = opos + np.array([horizontal_offset, vertical_offset])
+
 
             if o in self._last_opos:
                 cutter_vel = (opos - self._last_opos[o])
